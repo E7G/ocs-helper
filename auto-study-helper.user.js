@@ -16,7 +16,9 @@
         checkInterval: 2000,    // 检测间隔（毫秒）
         videoStuckTime: 5000,   // 视频卡住时间阈值
         debug: true,            // 调试模式
-        maxConsecutiveNoButton: 3 // 连续找不到下一节按钮的最大次数
+        maxConsecutiveNoButton: 3, // 连续找不到下一节按钮的最大次数
+        enableVideoStuckCheck: true, // 是否启用视频防卡住功能
+        enableAutoNext: true    // 是否启用自动下一行功能
     };
     
     // 全局状态
@@ -467,7 +469,7 @@
         log(`下一节按钮: ${nextButton ? '存在' : '不存在'}`);
         
         // 处理视频卡住
-        if (video) {
+        if (CONFIG.enableVideoStuckCheck && video) {
             log('开始检测视频是否卡住...');
             if (isVideoStuck(video)) {
                 log('检测到视频卡住，尝试跳转');
@@ -476,38 +478,46 @@
                 log('视频未检测到卡住');
             }
         } else {
-            log('视频元素不存在，跳过卡住检测');
+            if (!CONFIG.enableVideoStuckCheck) {
+                log('视频防卡住功能已禁用，跳过检测');
+            } else {
+                log('视频元素不存在，跳过卡住检测');
+            }
         }
         
         // 检查任务点完成并点击下一节
-        log('开始检测任务点状态...');
-        const taskCompleted = isTaskCompleted(task);
-        log(`任务点检测结果: ${taskCompleted ? '已完成' : '未完成'}`);
-        
-        if (taskCompleted) {
-            if (nextButton) {
-                // 找到下一节按钮，重置状态
+        if (CONFIG.enableAutoNext) {
+            log('开始检测任务点状态...');
+            const taskCompleted = isTaskCompleted(task);
+            log(`任务点检测结果: ${taskCompleted ? '已完成' : '未完成'}`);
+            
+            if (taskCompleted) {
+                if (nextButton) {
+                    // 找到下一节按钮，重置状态
+                    state.consecutiveNoButtonCount = 0;
+                    state.isLastSection = false;
+                    
+                    log('任务点已完成，准备点击下一节');
+                    safeClick(nextButton);
+                } else {
+                    // 任务完成但没找到下一节按钮
+                    state.consecutiveNoButtonCount++;
+                    
+                    if (state.consecutiveNoButtonCount >= CONFIG.maxConsecutiveNoButton) {
+                        state.isLastSection = true;
+                        log(`连续${CONFIG.maxConsecutiveNoButton}次未找到下一节按钮，判断为最后一节，停止查找`);
+                    } else {
+                        log(`任务点已完成，但未找到下一节按钮 (${state.consecutiveNoButtonCount}/${CONFIG.maxConsecutiveNoButton})`);
+                    }
+                }
+            } else {
+                // 任务未完成，重置状态
                 state.consecutiveNoButtonCount = 0;
                 state.isLastSection = false;
-                
-                log('任务点已完成，准备点击下一节');
-                safeClick(nextButton);
-            } else {
-                // 任务完成但没找到下一节按钮
-                state.consecutiveNoButtonCount++;
-                
-                if (state.consecutiveNoButtonCount >= CONFIG.maxConsecutiveNoButton) {
-                    state.isLastSection = true;
-                    log(`连续${CONFIG.maxConsecutiveNoButton}次未找到下一节按钮，判断为最后一节，停止查找`);
-                } else {
-                    log(`任务点已完成，但未找到下一节按钮 (${state.consecutiveNoButtonCount}/${CONFIG.maxConsecutiveNoButton})`);
-                }
+                log('任务点未完成，等待中...');
             }
         } else {
-            // 任务未完成，重置状态
-            state.consecutiveNoButtonCount = 0;
-            state.isLastSection = false;
-            log('任务点未完成，等待中...');
+            log('自动下一行功能已禁用，跳过检测');
         }
         
         log('=== 检测循环结束 ===');
@@ -571,6 +581,14 @@
         panel.innerHTML = `
             <div><strong>自动学习助手</strong></div>
             <div>状态: <span id="status">运行中</span></div>
+            <div style="margin-top: 5px;">
+                <input type="checkbox" id="videoStuckCheck" ${CONFIG.enableVideoStuckCheck ? 'checked' : ''}>
+                <label for="videoStuckCheck">视频防卡住</label>
+            </div>
+            <div>
+                <input type="checkbox" id="autoNextCheck" ${CONFIG.enableAutoNext ? 'checked' : ''}>
+                <label for="autoNextCheck">自动下一行</label>
+            </div>
             <button id="toggleBtn" style="margin-top: 5px; padding: 2px 8px;">暂停</button>
         `;
         
@@ -602,6 +620,18 @@
                 }
                 log('用户手动暂停检测');
             }
+        });
+        
+        // 视频防卡住功能开关
+        document.getElementById('videoStuckCheck').addEventListener('change', function() {
+            CONFIG.enableVideoStuckCheck = this.checked;
+            log(`视频防卡住功能已${this.checked ? '启用' : '禁用'}`);
+        });
+        
+        // 自动下一行功能开关
+        document.getElementById('autoNextCheck').addEventListener('change', function() {
+            CONFIG.enableAutoNext = this.checked;
+            log(`自动下一行功能已${this.checked ? '启用' : '禁用'}`);
         });
         
         // 启动定时器
