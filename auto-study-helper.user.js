@@ -1,30 +1,64 @@
 // ==UserScript==
 // @name         自动学习助手
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  自动处理视频播放和课程导航
 // @author       E7G
 // @match        https://mooc1.chaoxing.com/mycourse/studentstudy*
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
 // ==/UserScript==
 
 (function() {
     'use strict';
     
-    // 配置参数
+    function loadSettings() {
+        try {
+            const saved = GM_getValue('settings');
+            if (saved) {
+                return JSON.parse(saved);
+            }
+        } catch (e) {
+            console.log('[自动学习助手] 加载设置失败:', e);
+        }
+        return null;
+    }
+    
+    function saveSettings(settings) {
+        try {
+            GM_setValue('settings', JSON.stringify(settings));
+            console.log('[自动学习助手] 设置已保存');
+        } catch (e) {
+            console.log('[自动学习助手] 保存设置失败:', e);
+        }
+    }
+    
+    const defaultSettings = {
+        enableVideoStuckCheck: true,
+        enableAutoNext: true,
+        enableSkipChapterTest: false,
+        isRunning: true
+    };
+    
+    const savedSettings = loadSettings();
+    
     const CONFIG = {
-        checkInterval: 2000,    // 检测间隔（毫秒）
-        videoStuckTime: 5000,   // 视频卡住时间阈值
-        debug: true,            // 调试模式
-        maxConsecutiveNoButton: 3, // 连续找不到下一节按钮的最大次数
-        enableVideoStuckCheck: true, // 是否启用视频防卡住功能
-        enableAutoNext: true    // 是否启用自动下一行功能
+        checkInterval: 2000,
+        videoStuckTime: 5000,
+        debug: true,
+        maxConsecutiveNoButton: 3,
+        iframeLoadDelay: 3000,
+        enableVideoStuckCheck: savedSettings?.enableVideoStuckCheck ?? defaultSettings.enableVideoStuckCheck,
+        enableAutoNext: savedSettings?.enableAutoNext ?? defaultSettings.enableAutoNext,
+        enableSkipChapterTest: savedSettings?.enableSkipChapterTest ?? defaultSettings.enableSkipChapterTest,
+        isRunning: savedSettings?.isRunning ?? defaultSettings.isRunning
     };
     
     // 全局状态
     let state = {
-        consecutiveNoButtonCount: 0,  // 连续找不到下一节按钮的次数
-        isLastSection: false          // 是否为最后一节
+        consecutiveNoButtonCount: 0,
+        isLastSection: false,
+        skipCheckUntil: 0
     };
     
     // 日志函数
@@ -432,14 +466,104 @@
         return false;
     }
     
+    // 检测是否为章节测试页面
+    function isChapterTest() {
+        const selectors = [
+            '.newTestTitle',
+            '.TestTitle_name',
+            '[class*="TestTitle_name"]',
+            '[class*="newTestTitle"]',
+            '[class*="testTit_status"]',
+            'div.fl.TestTitle_name',
+            'div.TestTitle_name'
+        ];
+        
+        function checkInDocument(doc, location) {
+            for (const selector of selectors) {
+                try {
+                    const elements = doc.querySelectorAll(selector);
+                    if (elements.length > 0) {
+                        log(`[${location}] 找到 ${elements.length} 个元素: selector="${selector}"`);
+                    }
+                    
+                    for (const el of elements) {
+                        const text = el.textContent?.trim() || '';
+                        const className = el.className || '';
+                        
+                        if (text.includes('章节测验') || text.includes('章节测试') || text.includes('测验')) {
+                            log(`[${location}] 检测到章节测验: text="${text}", class="${className}"`);
+                            return true;
+                        }
+                        
+                        if (className.includes('TestTitle_name') && text.includes('章节')) {
+                            log(`[${location}] 检测到章节测验(通过class): text="${text}", class="${className}"`);
+                            return true;
+                        }
+                    }
+                } catch (e) {
+                    log(`[${location}] 选择器 ${selector} 查询失败: ${e.message}`);
+                }
+            }
+            
+            const testStatusElements = doc.querySelectorAll('[class*="testTit_status"]');
+            for (const el of testStatusElements) {
+                const parentText = el.parentElement?.textContent?.trim() || '';
+                if (parentText.includes('章节测验') || parentText.includes('章节测试')) {
+                    log(`[${location}] 通过testTit_status检测到章节测验: "${parentText}"`);
+                    return true;
+                }
+            }
+            
+            return false;
+        }
+        
+        if (checkInDocument(document, '主文档')) {
+            return true;
+        }
+        
+        function checkIframesRecursive(doc, depth) {
+            if (depth > 3) return false;
+            
+            const iframes = doc.querySelectorAll('iframe');
+            if (iframes.length > 0) {
+                log(`[递归depth${depth}] 找到 ${iframes.length} 个iframe`);
+            }
+            
+            for (let i = 0; i < iframes.length; i++) {
+                try {
+                    const iframe = iframes[i];
+                    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+                    
+                    if (iframeDoc) {
+                        if (checkInDocument(iframeDoc, `iframe[${i}]`)) {
+                            return true;
+                        }
+                        if (checkIframesRecursive(iframeDoc, depth + 1)) {
+                            return true;
+                        }
+                    }
+                } catch (e) {
+                    log(`访问iframe[${i}]失败: ${e.message}`);
+                }
+            }
+            return false;
+        }
+        
+        return checkIframesRecursive(document, 0);
+    }
+    
     // 主检测循环
     function mainCheck() {
-        // 如果已经判断为最后一节，暂停检测并给出提示
+        const now = Date.now();
+        if (now < state.skipCheckUntil) {
+            log(`等待iframe加载中，剩余 ${Math.ceil((state.skipCheckUntil - now) / 1000)} 秒...`);
+            return;
+        }
+        
         if (state.isLastSection) {
             log('检测到最后一节课程，自动暂停检测循环');
             log('如需继续检测，请刷新页面或点击控制面板的"开始"按钮');
             
-            // 更新控制面板状态
             const statusElement = document.getElementById('status');
             const toggleBtn = document.getElementById('toggleBtn');
             if (statusElement) {
@@ -449,16 +573,36 @@
                 toggleBtn.textContent = '开始';
             }
             
-            // 清除定时器，停止循环
             if (window.autoStudyInterval) {
                 clearInterval(window.autoStudyInterval);
                 window.autoStudyInterval = null;
             }
             
-            return; // 直接返回，不再执行后续检测
+            return;
         }
         
         log('=== 开始新的检测循环 ===');
+        
+        // 检测章节测试并跳过
+        if (CONFIG.enableSkipChapterTest && isChapterTest()) {
+            log('检测到章节测验，尝试跳过...');
+            const nextButton = getNextButton();
+            if (nextButton) {
+                state.consecutiveNoButtonCount = 0;
+                state.isLastSection = false;
+                log('章节测验页面，点击下一节跳过');
+                safeClick(nextButton);
+                state.skipCheckUntil = Date.now() + CONFIG.iframeLoadDelay;
+                log(`已点击下一节，等待 ${CONFIG.iframeLoadDelay / 1000} 秒让iframe加载...`);
+            } else {
+                state.consecutiveNoButtonCount++;
+                if (state.consecutiveNoButtonCount >= CONFIG.maxConsecutiveNoButton) {
+                    state.isLastSection = true;
+                    log('章节测验页面未找到下一节按钮，判断为最后一节');
+                }
+            }
+            return;
+        }
         
         const video = getVideoElement();
         const task = getTaskElement();
@@ -493,14 +637,14 @@
             
             if (taskCompleted) {
                 if (nextButton) {
-                    // 找到下一节按钮，重置状态
                     state.consecutiveNoButtonCount = 0;
                     state.isLastSection = false;
                     
                     log('任务点已完成，准备点击下一节');
                     safeClick(nextButton);
+                    state.skipCheckUntil = Date.now() + CONFIG.iframeLoadDelay;
+                    log(`已点击下一节，等待 ${CONFIG.iframeLoadDelay / 1000} 秒让iframe加载...`);
                 } else {
-                    // 任务完成但没找到下一节按钮
                     state.consecutiveNoButtonCount++;
                     
                     if (state.consecutiveNoButtonCount >= CONFIG.maxConsecutiveNoButton) {
@@ -511,7 +655,6 @@
                     }
                 }
             } else {
-                // 任务未完成，重置状态
                 state.consecutiveNoButtonCount = 0;
                 state.isLastSection = false;
                 log('任务点未完成，等待中...');
@@ -580,35 +723,47 @@
         
         panel.innerHTML = `
             <div><strong>自动学习助手</strong></div>
-            <div>状态: <span id="status">运行中</span></div>
+            <div>状态: <span id="status">${CONFIG.isRunning ? '运行中' : '已暂停'}</span></div>
             <div style="margin-top: 5px;">
                 <input type="checkbox" id="videoStuckCheck" ${CONFIG.enableVideoStuckCheck ? 'checked' : ''}>
                 <label for="videoStuckCheck">视频防卡住</label>
             </div>
             <div>
                 <input type="checkbox" id="autoNextCheck" ${CONFIG.enableAutoNext ? 'checked' : ''}>
-                <label for="autoNextCheck">自动下一行</label>
+                <label for="autoNextCheck">自动下一节</label>
             </div>
-            <button id="toggleBtn" style="margin-top: 5px; padding: 2px 8px;">暂停</button>
+            <div>
+                <input type="checkbox" id="skipChapterTestCheck" ${CONFIG.enableSkipChapterTest ? 'checked' : ''}>
+                <label for="skipChapterTestCheck">跳过章节测验</label>
+            </div>
+            <button id="toggleBtn" style="margin-top: 5px; padding: 2px 8px;">${CONFIG.isRunning ? '暂停' : '开始'}</button>
         `;
         
         document.body.appendChild(panel);
         
-        // 控制按钮功能
-        let isRunning = true;
-        let intervalId = null;
+        let isRunning = CONFIG.isRunning;
         
         function updateStatus(running) {
             document.getElementById('status').textContent = running ? '运行中' : '已暂停';
             document.getElementById('toggleBtn').textContent = running ? '暂停' : '开始';
         }
         
+        function saveAllSettings() {
+            saveSettings({
+                enableVideoStuckCheck: CONFIG.enableVideoStuckCheck,
+                enableAutoNext: CONFIG.enableAutoNext,
+                enableSkipChapterTest: CONFIG.enableSkipChapterTest,
+                isRunning: isRunning
+            });
+        }
+        
         document.getElementById('toggleBtn').addEventListener('click', function() {
             isRunning = !isRunning;
+            CONFIG.isRunning = isRunning;
             updateStatus(isRunning);
+            saveAllSettings();
             
             if (isRunning) {
-                // 重新开始时重置最后一节状态
                 state.isLastSection = false;
                 state.consecutiveNoButtonCount = 0;
                 window.autoStudyInterval = setInterval(mainCheck, CONFIG.checkInterval);
@@ -622,39 +777,47 @@
             }
         });
         
-        // 视频防卡住功能开关
         document.getElementById('videoStuckCheck').addEventListener('change', function() {
             CONFIG.enableVideoStuckCheck = this.checked;
+            saveAllSettings();
             log(`视频防卡住功能已${this.checked ? '启用' : '禁用'}`);
         });
         
-        // 自动下一行功能开关
         document.getElementById('autoNextCheck').addEventListener('change', function() {
             CONFIG.enableAutoNext = this.checked;
+            saveAllSettings();
             log(`自动下一行功能已${this.checked ? '启用' : '禁用'}`);
         });
         
-        // 启动定时器
-        window.autoStudyInterval = setInterval(mainCheck, CONFIG.checkInterval);
-        updateStatus(true);
+        document.getElementById('skipChapterTestCheck').addEventListener('change', function() {
+            CONFIG.enableSkipChapterTest = this.checked;
+            saveAllSettings();
+            log(`跳过章节测验功能已${this.checked ? '启用' : '禁用'}`);
+        });
+        
+        if (isRunning) {
+            window.autoStudyInterval = setInterval(mainCheck, CONFIG.checkInterval);
+        }
+        updateStatus(isRunning);
         
         log('自动学习助手已启动，检测间隔：' + CONFIG.checkInterval + 'ms');
         log('最后一节检测阈值：连续' + CONFIG.maxConsecutiveNoButton + '次未找到下一节按钮');
+        log('运行状态: ' + (isRunning ? '运行中' : '已暂停'));
     }
     
     // 页面加载完成后初始化
     function init() {
         log('自动学习助手初始化');
         
-        // 等待DOM加载
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', addControlPanel);
+        if (document.readyState === 'complete') {
+            setTimeout(addControlPanel, 500);
         } else {
-            addControlPanel();
+            window.addEventListener('load', function() {
+                setTimeout(addControlPanel, 500);
+            });
         }
     }
     
-    // 启动脚本
     init();
     
 })();
